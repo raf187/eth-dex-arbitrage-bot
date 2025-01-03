@@ -1,13 +1,15 @@
 import sys
+import asyncio
+from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QPushButton, QLabel, QLineEdit, QTableWidget, QTableWidgetItem, 
     QCheckBox, QGroupBox, QHBoxLayout, QMessageBox, QTabWidget)
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont
-from web3_client import Web3Client
-from dex_scanner import DexScanner
-from arbitrage_logic import ArbitrageLogic
-from stats_manager import StatsManager
+from PyQt6.QtGui import QFont, QColor
+from src.web3_client import Web3Client
+from src.dex_scanner import DexScanner
+from src.arbitrage_logic import ArbitrageLogic
+from src.stats_manager import StatsManager
 
 class ArbitrageBot(QMainWindow):
     def __init__(self):
@@ -29,6 +31,10 @@ class ArbitrageBot(QMainWindow):
         self.scan_timer.timeout.connect(self.scan_opportunities)
         self.stats_timer = QTimer()
         self.stats_timer.timeout.connect(self.update_stats_display)
+        
+        # État du bot
+        self.is_running = False
+        self.last_eth_price = 0
         
     def setup_ui(self):
         central_widget = QWidget()
@@ -60,14 +66,18 @@ class ArbitrageBot(QMainWindow):
         main_layout.addWidget(tabs)
         
     def setup_control_panel(self, layout):
-        control_group = QGroupBox("Contrôles")
+        control_group = QGroupBox("Paramètres")
         control_layout = QHBoxLayout()
         
-        # Paramètres de trading
+        # Profit minimum
         self.min_profit_input = QLineEdit()
         self.min_profit_input.setPlaceholderText('Profit minimum (%)')
         control_layout.addWidget(QLabel("Profit min:"))
         control_layout.addWidget(self.min_profit_input)
+        
+        # Volume minimum
+        volume_label = QLabel("Volume min: 25K USDT")
+        control_layout.addWidget(volume_label)
         
         # Mode automatique/manuel
         self.auto_mode = QCheckBox("Mode Automatique")
@@ -87,44 +97,45 @@ class ArbitrageBot(QMainWindow):
         
     def setup_opportunities_table(self, layout):
         self.opportunities_table = QTableWidget()
-        self.opportunities_table.setColumnCount(7)
+        self.opportunities_table.setColumnCount(8)
         self.opportunities_table.setHorizontalHeaderLabels([
             'Paire', 'Prix Uniswap', 'Prix Sushiswap', 
-            'Différence (%)', 'Volume (USDT)', 'Direction', 'Action'
+            'Différence (%)', 'Volume (USDT)', 'Gas (USDT)',
+            'Profit Net (USDT)', 'Action'
         ])
+        self.opportunities_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.opportunities_table)
         
     def setup_stats_panel(self, layout):
-        stats_grid = QVBoxLayout()
+        # En-tête des statistiques
+        stats_header = QHBoxLayout()
         
-        # Statistiques principales
+        # PnL Total
         self.pnl_label = QLabel('PnL Total: 0.00 USDT')
         self.pnl_label.setFont(QFont('Arial', 14, QFont.Weight.Bold))
-        stats_grid.addWidget(self.pnl_label)
+        stats_header.addWidget(self.pnl_label)
         
-        self.opportunities_found_label = QLabel('Opportunités trouvées: 0')
-        stats_grid.addWidget(self.opportunities_found_label)
+        # Nombre d'opportunités
+        self.opportunities_stats = QLabel('Opportunités: 0 trouvées / 0 prises')
+        stats_header.addWidget(self.opportunities_stats)
         
-        self.opportunities_taken_label = QLabel('Trades réalisés: 0')
-        stats_grid.addWidget(self.opportunities_taken_label)
-        
+        # Profit moyen
         self.avg_profit_label = QLabel('Profit moyen: 0.00%')
-        stats_grid.addWidget(self.avg_profit_label)
+        stats_header.addWidget(self.avg_profit_label)
         
-        # Tableau des derniers trades
+        layout.addLayout(stats_header)
+        
+        # Tableau des trades
         self.trades_table = QTableWidget()
-        self.trades_table.setColumnCount(5)
+        self.trades_table.setColumnCount(6)
         self.trades_table.setHorizontalHeaderLabels([
-            'Date/Heure', 'Paire', 'Profit USDT', 'Volume USDT', 'Profit %'
+            'Date/Heure', 'Paire', 'Volume (USDT)', 
+            'Gas (USDT)', 'Profit Net (USDT)', 'Profit (%)'
         ])
-        stats_grid.addWidget(self.trades_table)
-        
-        layout.addLayout(stats_grid)
-        
+        layout.addWidget(self.trades_table)
+
     def setup_tokens_panel(self, layout):
-        tokens_layout = QVBoxLayout()
-        
-        # Ajouter un nouveau token
+        # Ajout de token
         add_token_layout = QHBoxLayout()
         self.token_input = QLineEdit()
         self.token_input.setPlaceholderText('Adresse du token')
@@ -133,81 +144,147 @@ class ArbitrageBot(QMainWindow):
         add_button = QPushButton('Ajouter Token')
         add_button.clicked.connect(self.add_preferred_token)
         add_token_layout.addWidget(add_button)
-        tokens_layout.addLayout(add_token_layout)
+        layout.addLayout(add_token_layout)
         
-        # Liste des tokens préférés
+        # Liste des tokens
         self.preferred_tokens_table = QTableWidget()
         self.preferred_tokens_table.setColumnCount(3)
         self.preferred_tokens_table.setHorizontalHeaderLabels([
             'Adresse', 'Symbole', 'Action'
         ])
-        tokens_layout.addWidget(self.preferred_tokens_table)
-        
-        layout.addLayout(tokens_layout)
-        
-    def update_stats_display(self):
-        """Met à jour l'affichage des statistiques"""
-        stats = self.stats_manager.stats
-        
-        self.pnl_label.setText(f'PnL Total: {stats["total_pnl"]:.2f} USDT')
-        self.opportunities_found_label.setText(f'Opportunités trouvées: {stats["opportunities_found"]}')
-        self.opportunities_taken_label.setText(f'Trades réalisés: {stats["opportunities_taken"]}')
-        self.avg_profit_label.setText(f'Profit moyen: {self.stats_manager.get_average_profit():.2f}%')
-        
-        # Mise à jour du tableau des trades
-        self.update_trades_table()
-        
-    def update_trades_table(self):
-        """Met à jour le tableau des derniers trades"""
-        trades = self.stats_manager.stats['trades']
-        self.trades_table.setRowCount(len(trades))
-        
-        for i, trade in enumerate(reversed(trades)):
-            self.trades_table.setItem(i, 0, QTableWidgetItem(trade['timestamp']))
-            self.trades_table.setItem(i, 1, QTableWidgetItem(trade['pair']))
-            self.trades_table.setItem(i, 2, QTableWidgetItem(f"{trade['profit_usdt']:.2f}"))
-            self.trades_table.setItem(i, 3, QTableWidgetItem(f"{trade['volume_usdt']:.2f}"))
-            self.trades_table.setItem(i, 4, QTableWidgetItem(f"{trade['profit_percent']:.2f}%"))
-            
-    def add_preferred_token(self):
-        """Ajoute un token à la liste des préférés"""
-        token_address = self.token_input.text().strip()
-        if Web3.is_address(token_address):
-            self.stats_manager.add_preferred_token(token_address)
-            self.token_input.clear()
-            self.update_preferred_tokens_table()
-        else:
-            QMessageBox.warning(self, "Erreur", "Adresse de token invalide")
-            
-    def update_preferred_tokens_table(self):
-        """Met à jour la liste des tokens préférés"""
-        tokens = self.stats_manager.get_preferred_tokens()
-        self.preferred_tokens_table.setRowCount(len(tokens))
-        
-        for i, token in enumerate(tokens):
-            self.preferred_tokens_table.setItem(i, 0, QTableWidgetItem(token))
-            # TODO: Ajouter le symbole du token
-            
-            remove_button = QPushButton('Retirer')
-            remove_button.clicked.connect(lambda _, t=token: self.remove_preferred_token(t))
-            self.preferred_tokens_table.setCellWidget(i, 2, remove_button)
-            
-    def remove_preferred_token(self, token_address):
-        """Retire un token de la liste des préférés"""
-        self.stats_manager.remove_preferred_token(token_address)
+        layout.addWidget(self.preferred_tokens_table)
         self.update_preferred_tokens_table()
         
-    def toggle_bot(self):
-        if self.scan_timer.isActive():
-            self.scan_timer.stop()
-            self.stats_timer.stop()
-            self.start_button.setText('Démarrer')
-            self.status_label.setText('Status: Arrêté')
-        else:
-            if self.web3_client.check_connection():
-                self.scan_timer.start(5000)  # Scan toutes les 5 secondes
-                self.stats_timer.start(1000)  # Mise à jour des stats toutes les secondes
-                self.start_button.setText('Arrêter')
-                self.status_label.setText('Status: En cours de scan')
+    async def scan_opportunities(self):
+        """Scan et analyse les opportunités d'arbitrage"""
+        if not self.is_running:
+            return
+            
+        try:
+            # Mise à jour du prix ETH
+            self.last_eth_price = await self.web3_client.get_eth_price()
+            
+            # Scan des paires
+            pairs = await self.scanner.scan_pairs()
+            opportunities = []
+            
+            for pair in pairs:
+                opportunity = self.arbitrage_logic.analyze_pair(pair, self.last_eth_price)
+                if opportunity:
+                    opportunities.append(opportunity)
+                    self.stats_manager.add_opportunity_found()
+            
+            # Mise à jour du tableau des opportunités
+            self.update_opportunities_table(opportunities)
+            
+        except Exception as e:
+            self.show_error(f"Erreur lors du scan: {str(e)}")
+            
+    def update_opportunities_table(self, opportunities):
+        """Met à jour le tableau des opportunités"""
+        self.opportunities_table.setRowCount(len(opportunities))
+        
+        for i, opp in enumerate(opportunities):
+            # Pair name
+            self.opportunities_table.setItem(i, 0, QTableWidgetItem(opp['pair_data']['symbol']))
+            
+            # Prices
+            self.opportunities_table.setItem(i, 1, QTableWidgetItem(f"{opp['uni_price']:.8f}"))
+            self.opportunities_table.setItem(i, 2, QTableWidgetItem(f"{opp['sushi_price']:.8f}"))
+            
+            # Profit percentage
+            profit_item = QTableWidgetItem(f"{opp['profit_percent']:.2f}%")
+            profit_item.setForeground(QColor('green'))
+            self.opportunities_table.setItem(i, 3, profit_item)
+            
+            # Volume
+            self.opportunities_table.setItem(i, 4, QTableWidgetItem(f"{opp['volume_usdt']:.2f}"))
+            
+            # Gas cost
+            self.opportunities_table.setItem(i, 5, QTableWidgetItem(f"{opp['gas_cost_usdt']:.2f}"))
+            
+            # Net profit
+            net_profit_item = QTableWidgetItem(f"{opp['net_profit_usdt']:.2f}")
+            net_profit_item.setForeground(QColor('green'))
+            self.opportunities_table.setItem(i, 6, net_profit_item)
+            
+            # Action button
+            if self.auto_mode.isChecked():
+                status_text = "Auto" if opp['is_executing'] else "En attente"
             else:
-                QMessageBox.warning(self, "Erreur", "Impossible de se connecter à Ethereum")
+                trade_button = QPushButton("Trader")
+                trade_button.clicked.connect(lambda _, o=opp: self.execute_trade(o))
+                self.opportunities_table.setCellWidget(i, 7, trade_button)
+                
+    def toggle_bot(self):
+        """Démarre ou arrête le bot"""
+        if self.is_running:
+            self.stop_bot()
+        else:
+            self.start_bot()
+            
+    def start_bot(self):
+        """Démarre le bot"""
+        if not self.web3_client.check_connection():
+            self.show_error("Impossible de se connecter à Ethereum")
+            return
+            
+        self.is_running = True
+        self.start_button.setText('Arrêter')
+        self.status_label.setText('Status: En cours de scan')
+        self.scan_timer.start(5000)  # Scan toutes les 5 secondes
+        self.stats_timer.start(1000)  # Mise à jour des stats toutes les secondes
+        
+    def stop_bot(self):
+        """Arrête le bot"""
+        self.is_running = False
+        self.scan_timer.stop()
+        self.stats_timer.stop()
+        self.start_button.setText('Démarrer')
+        self.status_label.setText('Status: Arrêté')
+        
+    def show_error(self, message):
+        """Affiche une erreur"""
+        QMessageBox.critical(self, "Erreur", message)
+        
+    def execute_trade(self, opportunity):
+        """Exécute un trade d'arbitrage"""
+        if self.auto_mode.isChecked():
+            self.execute_trade_automatically(opportunity)
+        else:
+            self.show_trade_confirmation(opportunity)
+            
+    def execute_trade_automatically(self, opportunity):
+        """Exécute automatiquement le trade"""
+        asyncio.create_task(self._execute_trade(opportunity))
+            
+    async def _execute_trade(self, opportunity):
+        """Exécute le trade et met à jour les statistiques"""
+        try:
+            # TODO: Implémenter l'exécution du trade
+            pass
+        except Exception as e:
+            self.show_error(f"Erreur lors de l'exécution du trade: {str(e)}")
+            
+    def show_trade_confirmation(self, opportunity):
+        """Affiche une boîte de dialogue de confirmation pour le trade manuel"""
+        confirm = QMessageBox.question(
+            self,
+            "Confirmer le trade",
+            f"Voulez-vous exécuter ce trade?\n\n"
+            f"Paire: {opportunity['pair_data']['symbol']}\n"
+            f"Profit attendu: {opportunity['profit_percent']:.2f}%\n"
+            f"Volume: {opportunity['volume_usdt']:.2f} USDT\n"
+            f"Gas estimé: {opportunity['gas_cost_usdt']:.2f} USDT\n"
+            f"Profit net: {opportunity['net_profit_usdt']:.2f} USDT",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if confirm == QMessageBox.StandardButton.Yes:
+            self.execute_trade_automatically(opportunity)
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = ArbitrageBot()
+    window.show()
+    sys.exit(app.exec())
